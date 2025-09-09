@@ -1,4 +1,0 @@
-[1] coarse_init_TrainTime: 0 min 0 sec
-[1] init_geo: 0 min 0 sec
-[1] coarse_init_TrainTime: 0 min 0 sec
-[1] init_geo: 0 min 0 sec
