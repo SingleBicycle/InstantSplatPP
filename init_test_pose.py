@@ -16,17 +16,70 @@ from dust3r.inference import inference
 from dust3r.utils.device import to_numpy
 from dust3r.utils.geometry import inv
 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+
+# Import additional prior models
+try:
+    from vggt.model import VGGTModel
+except ImportError:
+    VGGTModel = None
+    print("Warning: VGGT model not available")
+
+try:
+    from lsm.model import LSMModel
+except ImportError:
+    LSMModel = None
+    print("Warning: LSM model not available")
+
+try:
+    from spatial_tracker_v2.model import SpatialTrackerV2Model
+except ImportError:
+    SpatialTrackerV2Model = None
+    print("Warning: SpatialTracker v2 model not available")
 from utils.sfm_utils import (save_intrinsics, save_extrinsic, save_points3D, save_time, save_images_and_masks,
                              init_filestructure, get_sorted_image_files, split_train_test, load_images, compute_co_vis_masks, rigid_points_registration)
 from utils.camera_utils import generate_interpolated_path
 
 
+def load_prior_model(model_type, ckpt_path, device):
+    """
+    Factory function to load different prior models based on model_type.
+    
+    Args:
+        model_type (str): Type of model to load ('mast3r', 'vggt', 'lsm', 'spatial_tracker_v2')
+        ckpt_path (str): Path to the model checkpoint
+        device: Device to load the model on
+        
+    Returns:
+        Loaded model instance
+    """
+    if model_type.lower() == 'mast3r':
+        return AsymmetricMASt3R.from_pretrained(ckpt_path).to(device)
+    
+    elif model_type.lower() == 'vggt':
+        if VGGTModel is None:
+            raise ImportError("VGGT model is not available. Please install the required dependencies.")
+        return VGGTModel.from_pretrained(ckpt_path).to(device)
+    
+    elif model_type.lower() == 'lsm':
+        if LSMModel is None:
+            raise ImportError("LSM model is not available. Please install the required dependencies.")
+        return LSMModel.from_pretrained(ckpt_path).to(device)
+    
+    elif model_type.lower() == 'spatial_tracker_v2':
+        if SpatialTrackerV2Model is None:
+            raise ImportError("SpatialTracker v2 model is not available. Please install the required dependencies.")
+        return SpatialTrackerV2Model.from_pretrained(ckpt_path).to(device)
+    
+    else:
+        raise ValueError(f"Unknown model type: {model_type}. Supported types: 'mast3r', 'vggt', 'lsm', 'spatial_tracker_v2'")
+
+
 def main(source_path, model_path, ckpt_path, device, batch_size, image_size, schedule, lr, niter, 
-         min_conf_thr, llffhold, n_views, co_vis_dsp, depth_thre, conf_aware_ranking=False, focal_avg=True, infer_video=False):
+         min_conf_thr, llffhold, n_views, co_vis_dsp, depth_thre, conf_aware_ranking=False, focal_avg=True, infer_video=False, model_type='mast3r'):
 
     # ---------------- (1) Load model and images ----------------  
     save_path, sparse_0_path, sparse_1_path = init_filestructure(Path(source_path), n_views)
-    model = AsymmetricMASt3R.from_pretrained(ckpt_path).to(device)
+    model = load_prior_model(model_type, ckpt_path, device)
     image_dir = Path(source_path) / 'images'
     image_files, image_suffix = get_sorted_image_files(image_dir)
     if infer_video:
@@ -95,8 +148,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process images and save results.')
     parser.add_argument('--source_path', '-s', type=str, required=True, help='Directory containing images')
     parser.add_argument('--model_path', '-m', type=str, required=True, help='Directory to save the results')
+    parser.add_argument('--model_type', type=str, default='mast3r', 
+        choices=['mast3r', 'vggt', 'lsm', 'spatial_tracker_v2'],
+        help='Type of prior model to use')
+    
+    # Set default checkpoint paths based on model type
+    default_checkpoints = {
+        'mast3r': './mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth',
+        'vggt': './vggt/checkpoints/VGGT_model.pth',
+        'lsm': './lsm/checkpoints/LSM_model.pth',
+        'spatial_tracker_v2': './spatial_tracker_v2/checkpoints/SpatialTrackerV2_model.pth'
+    }
+    
     parser.add_argument('--ckpt_path', type=str,
-        default='./mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth', help='Path to the model checkpoint')
+        default=default_checkpoints['mast3r'], help='Path to the model checkpoint')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use for inference')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for processing images')
     parser.add_argument('--image_size', type=int, default=512, help='Size to resize images')
@@ -114,5 +179,10 @@ if __name__ == "__main__":
     parser.add_argument('--infer_video', action="store_true")
 
     args = parser.parse_args()
+    
+    # Set default checkpoint path based on model type if not explicitly provided
+    if args.ckpt_path == default_checkpoints['mast3r'] and args.model_type != 'mast3r':
+        args.ckpt_path = default_checkpoints[args.model_type]
+    
     main(args.source_path, args.model_path, args.ckpt_path, args.device, args.batch_size, args.image_size, args.schedule, args.lr, args.niter,         
-          args.min_conf_thr, args.llffhold, args.n_views, args.co_vis_dsp, args.depth_thre, args.conf_aware_ranking, args.focal_avg, args.infer_video)
+          args.min_conf_thr, args.llffhold, args.n_views, args.co_vis_dsp, args.depth_thre, args.conf_aware_ranking, args.focal_avg, args.infer_video, args.model_type)

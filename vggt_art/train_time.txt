@@ -1,0 +1,3 @@
+[2] train_joint_TrainTime: 1 min 22 sec
+[2] train_joint: 1 min 25 sec
+[4] render: 2 min 22 sec

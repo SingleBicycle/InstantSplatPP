@@ -1,0 +1,10 @@
+Depth threshold: 0.01
+Vanilla points num: 456876
+Co_Mask DSP points num: 456876
+Co_Mask DSP ratio: 1.0
+
+Depth threshold: 0.01
+Vanilla points num: 456876
+Co_Mask DSP points num: 456876
+Co_Mask DSP ratio: 1.0
+
