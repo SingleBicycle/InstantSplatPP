@@ -23,14 +23,18 @@ try:
     from vggt.utils.load_fn import load_and_preprocess_images
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
     from vggt.utils.geometry import unproject_depth_map_to_point_map
+    VGGT_AVAILABLE = True
 except ImportError:
-    VGGT = None
+    VGGT_AVAILABLE = False
     print("Warning: VGGT model not available")
 
+#TODO implement LSM later
 try:
-    from lsm.model import LSMModel
+    from large_spatial_model.model import LSM_Dust3R
+    from large_spatial_model.configs import LSMConfig
+    LSM_AVAILABLE = True
 except ImportError:
-    LSMModel = None
+    LSM_AVAILABLE = False
     print("Warning: LSM model not available")
 
 try:
@@ -39,13 +43,26 @@ except ImportError:
     SpatialTrackerV2Model = None
     print("Warning: SpatialTracker v2 model not available")
 
+try:
+    from mapanything.models.mapanything.model import MapAnything
+    from mapanything.utils.image import load_images as mapanything_load_images
+    MAPANYTHING_AVAILABLE = True
+except ImportError:
+    MapAnything = None
+    mapanything_load_images = None
+    MAPANYTHING_AVAILABLE = False
+    print("Warning: MapAnything model not available")
+
 from utils.sfm_utils import (save_intrinsics, save_extrinsic, save_points3D, save_time, save_images_and_masks,
                              init_filestructure, get_sorted_image_files, split_train_test, load_images, compute_co_vis_masks)
 from utils.camera_utils import generate_interpolated_path
 
+
+
+
 class ModelOutputAdapter:
     """
-    Adapter for each model's output.
+    Adapter for each model's output, convert them for instantsplatpp's input format. 
     """
 
     @staticmethod
@@ -107,7 +124,123 @@ class ModelOutputAdapter:
         """
         return lsm_output
 
-# 
+    @staticmethod
+    def mapanything_adapter(mapanything_output, img_shape=None):
+        """
+        Convert MapAnything predictions (list[dict]) to EXACTLY the vggt_adapter schema.
+        Output:
+        extrinsics_w2c: (S, 4, 4) float32
+        intrinsics:     (S, 3, 3) float32
+        pts3d:          (S, H, W, 3) float32
+        confs:          (S, H, W) float32
+        depthmaps:      (S, H*W) float32
+        imgs:           (S, H, W, 3) float32 in [0,1]
+        focals:         (S, 1) float32
+        """
+        import torch
+
+        def to_np(x):
+            if isinstance(x, torch.Tensor):
+                x = x.detach().cpu()
+                try:
+                    return x.numpy()
+                except Exception:
+                    return x.float().numpy()
+            return np.asarray(x)
+
+        assert isinstance(mapanything_output, (list, tuple)) and len(mapanything_output) > 0, \
+            "MapAnything predictions must be a non-empty list"
+
+        all_pts3d, all_confs, all_depth2d, all_imgs = [], [], [], []
+        all_intrinsics, all_extrinsics, all_focals = [], [], []
+
+        for i, pred in enumerate(mapanything_output):
+            for k in ("pts3d", "conf", "depth_z", "img_no_norm", "intrinsics", "camera_poses"):
+                if k not in pred:
+                    raise KeyError(f"MapAnything prediction {i} missing key: '{k}'")
+
+            pts3d = to_np(pred["pts3d"])            # (1,H,W,3) -> (H,W,3)
+            conf  = to_np(pred["conf"])             # (1,H,W)   -> (H,W)
+            depth = to_np(pred["depth_z"])          # (1,H,W,1) -> (H,W)
+            img   = to_np(pred["img_no_norm"])      # (1,H,W,3) -> (H,W,3)
+            K     = to_np(pred["intrinsics"])       # (1,3,3)   -> (3,3)
+            c2w   = to_np(pred["camera_poses"])     # (1,4,4)   -> (4,4)
+
+            # ---- squeeze leading singleton dims ----
+            if pts3d.ndim == 4 and pts3d.shape[0] == 1:
+                pts3d = pts3d[0]
+            if conf.ndim == 3 and conf.shape[0] == 1:
+                conf = conf[0]
+            if depth.ndim == 4 and depth.shape[0] == 1:
+                depth = depth[0]
+            if img.ndim == 4 and img.shape[0] == 1:
+                img = img[0]
+            if K.ndim == 3 and K.shape[0] == 1:
+                K = K[0]
+            if c2w.ndim == 3 and c2w.shape[0] == 1:
+                c2w = c2w[0]
+
+            # depth -> (H, W)
+            if depth.ndim == 3 and depth.shape[-1] == 1:
+                depth = depth[..., 0]
+            elif depth.ndim != 2:
+                depth = np.squeeze(depth)
+            assert depth.ndim == 2, f"depth must be (H,W), got {depth.shape}"
+
+            # img -> (H,W,3) in [0,1]
+            if img.ndim == 3 and img.shape[0] in (1, 3) and img.shape[-1] not in (1, 3):
+                img = np.transpose(img, (1, 2, 0))  # CHW -> HWC
+            if img.max() > 1.0:
+                img = img / 255.0
+            if img.shape[-1] == 1:
+                img = np.repeat(img, 3, axis=-1)
+
+            # pts3d -> (H,W,3)
+            if pts3d.ndim == 2 and pts3d.shape[-1] == 3:
+                H, W = depth.shape
+                assert pts3d.shape[0] == H * W, f"pts3d is (N,3) with N={pts3d.shape[0]}, expected H*W={H*W}"
+                pts3d = pts3d.reshape(H, W, 3)
+            elif pts3d.ndim != 3:
+                raise ValueError(f"pts3d must be (H,W,3), got {pts3d.shape}")
+
+            # extrinsics: world->cam
+            w2c = np.linalg.inv(c2w).astype(np.float32)
+
+            # focals as (1,) for stacking to (S,1)
+            fx = np.asarray([K[0, 0]], dtype=np.float32)
+
+            all_pts3d.append(pts3d.astype(np.float32))
+            all_confs.append(conf.astype(np.float32))
+            all_depth2d.append(depth.astype(np.float32))
+            all_imgs.append(img.astype(np.float32))
+            all_intrinsics.append(K.astype(np.float32))
+            all_extrinsics.append(w2c)
+            all_focals.append(fx)
+
+        pts3d        = np.stack(all_pts3d, axis=0)                   # (S, H, W, 3)
+        confs        = np.stack(all_confs, axis=0)                   # (S, H, W)
+        depthmaps_2d = np.stack(all_depth2d, axis=0)                 # (S, H, W)
+        imgs         = np.stack(all_imgs, axis=0)                    # (S, H, W, 3)
+        intrinsics   = np.stack(all_intrinsics, axis=0)              # (S, 3, 3)
+        extrinsics   = np.stack(all_extrinsics, axis=0)              # (S, 4, 4)
+        focals       = np.stack(all_focals, axis=0)                  # (S, 1)
+
+        # Flatten depth to (S, H*W) to match vggt_adapter
+        S, H, W = depthmaps_2d.shape[0], depthmaps_2d.shape[-2], depthmaps_2d.shape[-1]
+        depthmaps = depthmaps_2d.reshape(S, -1).astype(np.float32)
+
+        return {
+            'extrinsics_w2c': extrinsics.astype(np.float32),
+            'intrinsics':      intrinsics.astype(np.float32),
+            'pts3d':           pts3d.astype(np.float32),
+            'confs':           confs.astype(np.float32),
+            'depthmaps':       depthmaps.astype(np.float32),
+            'imgs':            imgs.astype(np.float32),
+            'focals':          focals.astype(np.float32),
+        }
+
+
+
 def load_one_model(model_type, ckpt_path, device):
     """
     Load a single model based on the model_type
@@ -120,15 +253,20 @@ def load_one_model(model_type, ckpt_path, device):
     Returns:
         Loaded model instance
     """
-    print(f"Loading {model_type} model from {ckpt_path} on {device}...")
+    print(f"Loading {model_type} model on {device}...")
 
     if model_type.lower() == 'mast3r':
         return AsymmetricMASt3R.from_pretrained(ckpt_path).to(device)
 
     elif model_type.lower() == 'vggt':
+
+        if not VGGT_AVAILABLE:
+            raise ImportError("VGGT model is not available. Please install vggt.")
+
         model = VGGT()
+
         if os.path.exists(ckpt_path):
-            print(f"loading VGGT from local path {ckpt_path}...")
+            print(f"Loading VGGT from local path {ckpt_path}...")
             try:
                 model.load_state_dict(torch.load(ckpt_path, map_location=device))
             except Exception as e:
@@ -147,13 +285,77 @@ def load_one_model(model_type, ckpt_path, device):
         return model.to(device).eval()
 
     elif model_type.lower() == 'lsm':
-        print(f"not yet implemented")
-        return None
+        if not LSM_AVAILABLE:
+            raise ImportError("LSM model is not available. Please install large_spatial_model.")
+
+        if ckpt_path.endswith('.pth'):
+            config_path = ckpt_path.replace('.pth', '_config.yaml')
+        elif ckpt_path.endswith('.pt'):
+            config_path = ckpt_path.replace('.pt', '_config.yaml')
+        else:
+            config_path = ckpt_path + '_config.yaml'
+        
+        if os.path.exists(config_path):
+            from omegaconf import OmegaConf
+            config_dict = OmegaConf.load(config_path)
+            config = LSMConfig(**config_dict)
+        else:
+            print("using default config")
+            config = LSMConfig()
+        
+        #initialize model
+        model = LSM_Dust3R(config)
+
+        if os.path.exists(ckpt_path):
+            print(f"Loading LSM from local path {ckpt_path}...")
+            checkpoint = torch.load(ckpt_path, map_location=map)
+            if 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            elif 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            else: 
+                state_dict = checkpoint
+        
+            model.load_state_dict(state_dict, strict=False)
+            print("LSM loaded successfully")
+        else:
+            print("Warning: no LSM checkpoint found, using default config")
+        
+        return model.to(device).eval()
+
     elif model_type.lower() == 'spatial_tracker_v2':
         print(f"not yet implemented")
         return None
+    
+    elif model_type.lower() == 'mapanything':
+        if not MAPANYTHING_AVAILABLE:
+            raise ImportError("MapAnything model is not available. Please install map-anything.")
+        
+        # MapAnything can be loaded from HuggingFace or local checkpoint
+        if os.path.exists(ckpt_path):
+            print(f"Loading MapAnything from local path {ckpt_path}...")
+            try:
+                # Load from local checkpoint
+                model = MapAnything.from_pretrained(ckpt_path).to(device)
+            except Exception as e:
+                print(f"Warning: Could not load MapAnything from local path {ckpt_path}: {e}")
+                print("Using MapAnything model from HuggingFace")
+                model = MapAnything.from_pretrained("facebook/map-anything").to(device)
+        else:
+            try:
+                print("Loading MapAnything model from HuggingFace: facebook/map-anything")
+                model = MapAnything.from_pretrained("facebook/map-anything").to(device)
+                #print model architecture
+                # with open('model_arch.txt', 'w') as f: print(model, file=f);
+                # import sys; sys.exit(0);
+            except Exception as e:
+                print(f"Warning: Could not load MapAnything pretrained weights: {e}")
+                raise ImportError("Failed to load MapAnything model")
+        
+        return model.eval()
+    
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Supported types: 'mast3r', 'vggt', 'lsm', 'spatial_tracker_v2'")
+        raise ValueError(f"Unknown model type: {model_type}. Supported types: 'mast3r', 'vggt', 'lsm', 'spatial_tracker_v2', 'mapanything'")
 
 def run_model_inference(model, model_type, images, image_files, device, schedule, lr, niter, focal_avg):
     """
@@ -179,6 +381,7 @@ def run_model_inference(model, model_type, images, image_files, device, schedule
         images_tensor = load_and_preprocess_images(image_files).to(device)
 
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        
         with torch.no_grad():
              with torch.cuda.amp.autocast(dtype=dtype):
                 predictions = model(images_tensor)
@@ -186,12 +389,53 @@ def run_model_inference(model, model_type, images, image_files, device, schedule
 
     elif model_type == 'lsm':
         #fake lsm output
+        lsm_output = {}  # Placeholder for LSM output
         result = ModelOutputAdapter.lsm_adapter(lsm_output, images.shape)
     elif model_type == 'spatial_tracker_v2':
         #fake spatial_tracker_v2 output
+        spatial_tracker_v2_output = {}  # Placeholder for spatial_tracker_v2 output
         result = ModelOutputAdapter.spatial_tracker_v2_adapter(spatial_tracker_v2_output, images.shape)
     
+    elif model_type == 'mapanything':
+        # Load images using MapAnything's image loader
+        views = mapanything_load_images(image_files)
+        
+        # Run MapAnything inference
+        predictions = model.infer(
+            views,
+            memory_efficient_inference=False,  # Set to True for large scenes
+            use_amp=True,                     # Use mixed precision
+            amp_dtype="bf16",                 # Use bf16 if available
+            apply_mask=True,                  # Apply masking to outputs
+            mask_edges=True,                  # Remove edge artifacts
+            apply_confidence_mask=False,      # Don't filter by confidence
+            confidence_percentile=10,         # Bottom percentile to remove
+        )
+
+        def _describe_mapanything(preds, max_items=3):
+            import torch, numpy as np
+            def _shape(x):
+                if isinstance(x, torch.Tensor): return f"torch{tuple(x.shape)} device={x.device} dtype={x.dtype}"
+                if isinstance(x, np.ndarray):   return f"np{tuple(x.shape)} dtype={x.dtype}"
+                return f"{type(x)}"
+            print(f"[MAPANYTHING] type={type(preds)} len={len(preds) if isinstance(preds, (list,tuple)) else 'N/A'}")
+            for i, p in enumerate(preds[:max_items]):
+                print(f"  item #{i}: keys={list(p.keys())}")
+                for k in ("pts3d","conf","depth_z","img_no_norm","intrinsics","camera_poses"):
+                    if k in p:
+                        print(f"    {k:12s}: {_shape(p[k])}")
+                    else:
+                        print(f"    {k:12s}: MISSING")
+            print("---- end describe ----")
+
+        _describe_mapanything(predictions)
+
+        
+        # Convert MapAnything output to expected format
+        result = ModelOutputAdapter.mapanything_adapter(predictions, None)
+    
     return result
+
 
 # def load_prior_model(model_type, ckpt_path, device):
 #     """
@@ -351,7 +595,7 @@ if __name__ == "__main__":
     parser.add_argument('--source_path', '-s', type=str, required=True, help='Directory containing images')
     parser.add_argument('--model_path', '-m', type=str, required=True, help='Directory to save the results')
     parser.add_argument('--model_type', type=str, default='mast3r', 
-        choices=['mast3r', 'vggt', 'lsm', 'spatial_tracker_v2'],
+        choices=['mast3r', 'vggt', 'lsm', 'spatial_tracker_v2', 'mapanything'],
         help='Type of prior model to use')
     
     # Set default checkpoint paths based on model type
@@ -359,11 +603,11 @@ if __name__ == "__main__":
         'mast3r': './mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth',
         'vggt': './vggt/checkpoints/VGGT_model.pth',
         'lsm': './lsm/checkpoints/LSM_model.pth',
-        'spatial_tracker_v2': './spatial_tracker_v2/checkpoints/SpatialTrackerV2_model.pth'
+        'spatial_tracker_v2': './spatial_tracker_v2/checkpoints/SpatialTrackerV2_model.pth',
+        'mapanything': 'facebook/map-anything'  # HuggingFace model ID
     }
     
-    parser.add_argument('--ckpt_path', type=str,
-        default=default_checkpoints['mast3r'], help='Path to the model checkpoint')
+    parser.add_argument('--ckpt_path', type=str, default=default_checkpoints['mast3r'], help='Path to the model checkpoint')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use for inference')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for processing images')
     parser.add_argument('--image_size', type=int, default=512, help='Size to resize images')
@@ -379,6 +623,7 @@ if __name__ == "__main__":
     parser.add_argument('--co_vis_dsp', action="store_true")
     parser.add_argument('--depth_thre', type=float, default=0.01, help='Depth threshold')
     parser.add_argument('--infer_video', action="store_true")
+    
 
     args = parser.parse_args()
     
