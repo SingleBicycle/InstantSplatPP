@@ -1,0 +1,32 @@
+defaults:
+  - _self_
+
+# Train loader builds from this spec string
+# We call LabSceneDataset with the parameters expected by BaseDataset.
+train_dataset: |
+  LabSceneDataset(
+    root='${hydra:runtime.cwd}/lab_scenes_test',
+    scene='sparse_12/0',
+    num_views=${dataset.num_views},
+    variable_num_views=${dataset.train.variable_num_views},
+    resolution=${dataset.resolution_train},
+    transform='imgnorm',
+    data_norm_type='dust3r',
+    use_masks=True,
+    split='train',
+    covisibility_thres=None,
+    principal_point_centered=${dataset.principal_point_centered}
+  )
+
+# No validation set by default; you can override when needed
+test_dataset: "[null]"
+
+# Dataloader config
+num_workers: 4
+num_views: 2
+principal_point_centered: false
+
+train:
+  variable_num_views: false
+resolution_train: 512
+resolution_val: 512

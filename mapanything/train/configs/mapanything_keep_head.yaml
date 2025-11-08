@@ -1,0 +1,89 @@
+# Custom Hydra entry point for training only the MapAnything decoder keep head
+# while using the existing InstantSplatPP environment.
+
+hydra:
+  searchpath:
+    - file:///data1/tzz/InstantSplatPP/mapanything/train/configs
+    - file:///data1/tzz/InstantSplatPP/map-anything/configs
+
+defaults:
+  - train
+  - override /model: modular_dust3r_512_dpt
+  # TODO: point this to the dataset you want (train config lives under map-anything/configs/dataset/)
+  - override /dataset: dataset_lab_scene
+  - override /loss: default
+  - override /train_params: default
+  - override /machine: aws
+  - override /distributed: default
+  - _self_
+
+# -----------------------------------------------------------------------------
+# Model overrides
+# -----------------------------------------------------------------------------
+model:
+  # Enable the new keep head on top of the DPT decoder
+  pred_head:
+    keep_head:
+      enabled: true
+      hidden_dims: [128, 64]
+      activation: relu
+      predict_log_variance: true
+  model_config:
+    # Optionally point to a checkpoint so encoder/transformer start from pretrained weights.
+    pretrained_checkpoint_path: null #${oc.env:MAPANYTHING_PRETRAINED,null}
+    load_specific_pretrained_submodules: true
+    specific_pretrained_submodules:
+      - encoder
+      - info_sharing
+      - dpt_feature_head1
+      - dpt_regressor_head1
+      - dpt_feature_head2
+      - dpt_regressor_head2
+      - adaptor
+  encoder:
+    pretrained_checkpoint_path: null        # stop loading CroCo_Encoder_224.pth
+  info_sharing:
+    module_args:
+      pretrained_checkpoint_path: null  
+
+# -----------------------------------------------------------------------------
+# Freeze everything except the keep head so only the new branch trains.
+# -----------------------------------------------------------------------------
+train_params:
+  max_num_of_imgs_per_gpu: 2
+  epochs: 1
+  lr: 1e-4
+  weight_decay: 0.0
+  resume: false
+  resume_ckpt: null
+  start_epoch: 0
+  submodule_configs:
+    encoder: {lr: 0}
+    info_sharing: {lr: 0}
+    dpt_feature_head1: {lr: 0}
+    dpt_regressor_head1: {lr: 0}
+    dpt_feature_head2: {lr: 0}
+    dpt_regressor_head2: {lr: 0}
+    adaptor: {lr: 0}
+    keep_head: {lr: 1e-4, weight_decay: 0.0}
+
+# -----------------------------------------------------------------------------
+# Plug the new loss in so gradients come only from the keep logits.
+# -----------------------------------------------------------------------------
+loss:
+  train_criterion: |
+    KeepPointSelectionLoss(
+      anchor_view_idx=0,
+      knn_k=8,
+      max_points=8192,
+      lambda_rep=0.2,
+      lambda_card=0.1,
+      cardinality_target=0.3,
+      min_precision=1.0
+    )
+  test_criterion: ${loss.train_criterion}
+
+# -----------------------------------------------------------------------------
+# Logging / experiment output
+# -----------------------------------------------------------------------------
+output_dir: /data1/tzz/InstantSplatPP/experiments
